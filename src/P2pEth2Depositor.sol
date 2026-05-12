@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity 0.8.10;
+pragma solidity 0.8.24;
 
-import "./@openzeppelin/contracts/access/Ownable.sol";
-import "./@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "./interfaces/IDepositContract.sol";
 
 contract P2pEth2Depositor is Pausable, Ownable {
@@ -14,23 +14,26 @@ contract P2pEth2Depositor is Pausable, Ownable {
     IDepositContract public immutable depositContract;
 
     /**
-     * @dev Minimal and maximum amount of nodes per transaction.
+     * @dev Minimum and maximum number of validators (deposit entries) per transaction.
      */
-    uint256 public constant nodesMinAmount = 1;
-    uint256 public constant nodesMaxAmount = 100;
+    uint256 public constant minValidatorsPerTx = 1;
+    uint256 public constant maxValidatorsPerTx = 100;
     uint256 public constant pubkeyLength = 48;
     uint256 public constant credentialsLength = 32;
     uint256 public constant signatureLength = 96;
+    bytes1 public constant ETH1_WITHDRAWAL_PREFIX = 0x01;
 
     /**
-     * @dev Collateral size of one node.
+     * @dev Per-validator deposit upper bound (`amounts[i] <= maxCollateral`).
+     * `collateral` is the 32 ETH threshold used only for the large-deposit withdrawal-credentials guard (`amounts[i] > collateral`).
      */
     uint256 public constant collateral = 32 ether;
+    uint256 public constant maxCollateral = 2048 ether;
 
     /**
      * @dev Setting Eth2 Smart Contract address during construction.
      */
-    constructor(bool mainnet, address depositContract_) {
+    constructor(bool mainnet, address depositContract_) Ownable(msg.sender) {
         depositContract = mainnet
             ? IDepositContract(0x00000000219ab540356cBB839Cbe05303d7705Fa)
             : (depositContract_ == 0x0000000000000000000000000000000000000000)
@@ -46,38 +49,54 @@ contract P2pEth2Depositor is Pausable, Ownable {
     }
 
     /**
-     * @dev Function that allows to deposit up to 100 nodes at once.
+     * @dev Function that allows up to maxValidatorsPerTx validators per transaction.
      *
      * - pubkeys                - Array of BLS12-381 public keys.
      * - withdrawal_credentials - Array of commitments to a public keys for withdrawals.
      * - signatures             - Array of BLS12-381 signatures.
      * - deposit_data_roots     - Array of the SHA-256 hashes of the SSZ-encoded DepositData objects.
+     * - amounts                - Array of ETH amounts for each validator deposit.
      */
     function deposit(
         bytes[] calldata pubkeys,
         bytes[] calldata withdrawal_credentials,
         bytes[] calldata signatures,
-        bytes32[] calldata deposit_data_roots
+        bytes32[] calldata deposit_data_roots,
+        uint256[] calldata amounts
     ) external payable whenNotPaused {
 
-        uint256 nodesAmount = pubkeys.length;
-
-        require(nodesAmount > 0 && nodesAmount <= 100, "P2pEth2Depositor: you can deposit only 1 to 100 nodes per transaction");
-        require(msg.value == collateral * nodesAmount, "P2pEth2Depositor: the amount of ETH does not match the amount of nodes");
-
+        uint256 validatorCount = pubkeys.length;
 
         require(
-            withdrawal_credentials.length == nodesAmount &&
-            signatures.length == nodesAmount &&
-            deposit_data_roots.length == nodesAmount,
+            validatorCount >= minValidatorsPerTx && validatorCount <= maxValidatorsPerTx,
+            "P2pEth2Depositor: you can deposit only 1 to 100 validators per transaction"
+        );
+        require(
+            withdrawal_credentials.length == validatorCount &&
+            signatures.length == validatorCount &&
+            deposit_data_roots.length == validatorCount &&
+            amounts.length == validatorCount,
             "P2pEth2Depositor: amount of parameters do no match");
 
-        for (uint256 i = 0; i < nodesAmount; ++i) {
+        uint256 totalAmount = 0;
+
+        for (uint256 i = 0; i < validatorCount; ++i) {
             require(pubkeys[i].length == pubkeyLength, "P2pEth2Depositor: wrong pubkey");
             require(withdrawal_credentials[i].length == credentialsLength, "P2pEth2Depositor: wrong withdrawal credentials");
             require(signatures[i].length == signatureLength, "P2pEth2Depositor: wrong signatures");
+            require(amounts[i] <= maxCollateral, "P2pEth2Depositor: amount is above maximum");
 
-            depositContract.deposit{value: collateral}(
+            if (amounts[i] > collateral) {
+                require(withdrawal_credentials[i][0] != ETH1_WITHDRAWAL_PREFIX, "P2pEth2Depositor: large deposit cannot use 0x01");
+            }
+
+            totalAmount += amounts[i];
+        }
+
+        require(msg.value == totalAmount, "P2pEth2Depositor: ETH sent must equal sum of amounts");
+
+        for (uint256 i = 0; i < validatorCount; ++i) {
+            depositContract.deposit{value: amounts[i]}(
                 pubkeys[i],
                 withdrawal_credentials[i],
                 signatures[i],
@@ -86,7 +105,7 @@ contract P2pEth2Depositor is Pausable, Ownable {
 
         }
 
-        emit DepositEvent(msg.sender, nodesAmount);
+        emit DepositEvent(msg.sender, validatorCount, totalAmount);
     }
 
     /**
@@ -111,5 +130,5 @@ contract P2pEth2Depositor is Pausable, Ownable {
         _unpause();
     }
 
-    event DepositEvent(address from, uint256 nodesAmount);
+    event DepositEvent(address indexed from, uint256 validatorCount, uint256 totalAmount);
 }
